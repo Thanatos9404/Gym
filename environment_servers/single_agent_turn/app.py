@@ -23,6 +23,7 @@ from nemo_gym.base_resources_server import (
     ResourcesSeedSessionResponse,
 )
 from nemo_gym.base_responses_api_agent import (
+    AGENT_ACTIVATION_HEADER,
     AgentCloseSessionRequest,
     AgentCloseSessionResponse,
     AgentSeedSessionRequest,
@@ -311,6 +312,10 @@ class SingleAgentTurnEnvironmentServer(BaseEnvironmentServer[SingleAgentTurnRequ
                     ),
                 )
             )
+            # The MCP session token names this attempt, and the Resources Server refuses it once a restore replaces it.
+            # An agent continued from a checkpoint would keep that token and see every tool call fail.
+            # So the episode restarts from its input after a crash, and its new seed mints a token for the new attempt.
+            await self.checkpoint_restart(request)
 
         try:
             agent_create_http_response = await self.server_client.post(
@@ -347,6 +352,9 @@ class SingleAgentTurnEnvironmentServer(BaseEnvironmentServer[SingleAgentTurnRequ
                 url_path=self._agent_responses_path(request),
                 json=request.task.task_input.responses_create_params,
                 cookies=handles.agent_cookies,
+                # The episode's only activation.
+                # A restore before its reply invokes it again, and the agent gives the reply it already gave.
+                headers={AGENT_ACTIVATION_HEADER: "1"},
             )
             await raise_for_status(agent_http_response)
             response_cookies = _cookies(agent_http_response)
