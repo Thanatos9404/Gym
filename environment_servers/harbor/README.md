@@ -54,8 +54,74 @@ the task folders, written by `gym dataset fetch`; on OpenSandbox the provider bl
 `benchmarks/terminal_bench_4/resources.yaml` shows. `[environment.healthcheck]` is polled at seed.
 Tasks that declare GPUs run on the `gpu_sandbox_provider` block when one is set. The task's
 `[[environment.mcp_servers]]` and `skills_dir` are written to `/tmp/.nemo-gym/task.json` in the agent's
-sandbox for harnesses that drive task MCP servers from inside it (mini-SWE does). Dockerfile builds and
-multi-step tasks come in later milestones.
+sandbox for harnesses that drive task MCP servers from inside it (mini-SWE does). Dockerfiles outside pull
+and overlay mode are built at prepare, see below. Multi-step tasks come in a later milestone.
+
+## Dockerfile builds
+
+Prepare decides one of three image modes per distinct Dockerfile.
+
+- Pull. A base-image-only file (`FROM` plus `WORKDIR`, `ENV`, `USER`, `LABEL`). The sandbox starts from the
+  base image.
+- Overlay. A pullable `FROM` plus `RUN` lines. The server runs the lines in the pulled base image at seed.
+  No build and no registry.
+- Build. Everything else: `COPY`, `ADD`, heredocs, BuildKit flags, multi-stage files. The task's
+  `environment/` folder is the build context. Prepare builds it once, records it, and the task then runs in
+  pull mode from the built image.
+
+The image is named the way Harbor names it, `hb__<hash>`, where the hash is Harbor's 32-character content
+hash of the `environment/` folder, its environment id (vendored from Harbor v0.22.0 in
+`nemo_gym/tasks/harbor/harbor_compat.py`), so identical contexts get the same image name in Harbor and in
+Gym. Builds are configured by a top-level `builds:` block in the merged configuration (`env.yaml`, a
+`--config` file, or `++builds.<setting>=<value>` on the command line; explicit settings apply over the
+defaults below):
+
+```yaml
+builds:
+  tool: buildah            # buildah, podman or docker; default: the first one on PATH that fits
+  repository: registry/path  # push built images under this path; default: $NEMO_GYM_BUILD_REPOSITORY
+  platform: linux/amd64    # the platform asked of the tool; default linux/amd64
+  enabled: true            # false never builds; tasks that need a build are skipped with a message
+```
+
+With `builds.repository` (or the `NEMO_GYM_BUILD_REPOSITORY` variable) the image is named
+`registry/path/hb__<hash>` and pushed, which is what OpenSandbox needs. The build then runs with the first
+of `buildah`, `podman` and `docker` found on PATH, or the tool named by `builds.tool`.
+buildah runs rootless, with the `vfs` storage driver and `chroot` isolation, under a node-local storage
+root (`/raid/scratch/<user>/nemo-gym-buildah` when that disk exists, else the system temp folder). Without
+a repository the image stays local as `hb__<hash>`, and only `docker` can build it: the Docker
+daemon is the one local store a sandbox provider starts images from, so buildah and podman are refused
+without a repository. That is the laptop path with the Docker provider.
+
+Images are built for `linux/amd64`, the platform the sandboxes run. The tool is asked for that platform,
+and an image that comes out for another one is refused before it is pushed or recorded. Building on an
+arm64 host therefore needs qemu with binfmt registered, or an x86 node. `builds.platform: OS/ARCH` overrides
+the target. `builds.enabled: false` never builds. Tasks that need a build and have none recorded are then
+skipped with a message that says so.
+
+The hash is SHA-256 over the sorted relative paths and bytes of the regular files in the build context,
+exactly as Harbor computes it: symbolic links and anything under `__pycache__`, `.git` or `.DS_Store` are
+skipped, and file modes are not part of it. Two tasks with identical `environment/` folders share one
+image and a changed file gets a new one. `built-images.json` next to the task folders maps each context
+hash to the image, the tasks that use it, the tool and whether it was pushed. Deleting a context's entry
+from that file forces a rebuild of it at the next prepare; there is no flag for that, since a changed
+Dockerfile or context is a new hash and builds on its own. The built image's
+configuration lands in `compose-images.json` beside it, so the loader reads the Dockerfile's final
+`WORKDIR`, `ENV` and `USER` from it like any pulled image. A recorded image is reused when it fits the run:
+a pushed image serves every run, a local one only runs that push nothing, and the platform has to match.
+Otherwise it is rebuilt and the record replaced, and prepare says why. An image is recorded only after it
+was built, pushed and inspected, and each one as soon as it is done, so an interrupted prepare resumes
+where it stopped. A failed build stops the preparation and names the tasks. Prepare also writes the
+distinct images of the prepared tasks to `results/harbor/<taskset>/images.json`, for pre-pulling.
+
+The build tool pushes with its own login. Pulling a pushed image into a sandbox uses the registry
+credentials of the sandbox provider block (`images.auth`), the same way as any private image. The sandbox
+is created with the Dockerfile's final `USER` (or `[agent].user`) as the default for every command, on every
+provider, not only for the overlay `RUN` lines. An overlay task starts without that default, because its
+`RUN` lines may be what creates the user, and switches to it once they have run. A numeric `USER 1000` is
+resolved to its name in the image with `getent` first, because OpenSandbox and PTY sessions switch user by
+name. When the uid names no user, the number stays and the seed logs a warning: Docker accepts a uid as
+it is, the other providers cannot run commands as it.
 
 | Setting or feature | Behavior in this layer |
 | --- | --- |
